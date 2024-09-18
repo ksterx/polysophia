@@ -1,4 +1,4 @@
-if __name__ == '__main__':
+if __name__ == "__main__":
     from polysophia.core.connection import Graph, Node, Processor, Publisher, Subscriber
 
     graph = Graph()

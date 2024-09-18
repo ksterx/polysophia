@@ -3,8 +3,10 @@ import json
 import uuid
 from typing import Any, Literal
 
+import graphviz
 import numpy as np
 import requests
+import websockets
 
 # import websockets
 from pydantic import BaseModel, Field
@@ -22,15 +24,32 @@ class Processor(BaseModel):
         pass
 
 
+class NodeCallback(BaseModel):
+    def on_connect(self):
+        pass
+
+    def on_disconnect(self):
+        pass
+
+    def on_start(self):
+        pass
+
+    def on_stop(self):
+        pass
+
+
 class Node(BaseModel):
-    id: uuid.UUID = Field(uuid.uuid4())
+    id: uuid.UUID = Field(uuid.uuid4(), description="Unique identifier of the node")
     name: str = Field(..., description="Name of the node")
-    callbacks: dict[str, Any | None] = Field({}, description="Callbacks of the node")
+    callbacks: dict[str, NodeCallback] = Field({}, description="Callbacks of the node")
     processor: Processor | None = Field(None, description="Processor of the node")
     status: Literal["up", "down"] = Field("down", description="Status of the node")
 
     def __repr__(self) -> str:
-        return f"Node({self.name})"
+        return f"Node('{self.name}')"
+
+    def __str__(self) -> str:
+        return self.__repr__()
 
     def __hash__(self) -> int:
         return hash(self.id)
@@ -43,31 +62,35 @@ class Node(BaseModel):
 
     def on_start(self):
         logger.info(f"{self.name} started")
+        for callback in self.callbacks:
+            callback.on_start()
 
     def on_connect(self):
         logger.info(f"{self.name} connected")
+        for callback in self.callbacks:
+            callback.on_connect()
 
     def on_disconnect(self):
         logger.info(f"{self.name} disconnected")
+        for callback in self.callbacks:
+            callback.on_disconnect()
 
 
-class TopicNode(Node):
-    topic: str = Field(..., description="Topic of the node")
+class Publisher(Node):
+    processor: Processor
+    memory: Memory | None = Field(None, description="Memory of the publisher")
+    memory_kwargs: dict[str, Any] | None = Field(None, description="Memory kwargs")
 
-
-class Publisher(TopicNode):
-    def __init__(self, processor, memory: Memory | None = None, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.processor = processor
-        self.memory = memory
-
-    def publish(self):
+    def publish(self, **kwargs):
         while True:
-            inputs = self.memory.read(self.topic)
-            self.processor(**inputs)
+            if self.memory:
+                inputs = self.memory.read(self.name)
+                self.processor(**inputs, **kwargs)
+            else:
+                self.processor(**kwargs)
 
 
-class Subscriber(TopicNode):
+class Subscriber(Node):
     def __init__(self, processor, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.processor = processor
@@ -111,9 +134,12 @@ class Graph:
     def __repr__(self):
         return f"Graph({self.node_list})"
 
-    def add(self, node: Node):
+    def __str__(self):
+        return self.__repr__()
+
+    def add(self, node: Node) -> None:
         self.nodes.add(node)
-        self._add(1)
+        self._update_connection(1)
 
     def remove(self, node: int | Node) -> None:
         if isinstance(node, int):
@@ -123,24 +149,30 @@ class Graph:
         else:
             raise TypeError("node should be Node or int")
 
-        logger.info(f"Node ({node.name}) removed")
+        logger.info(f"{node} removed")
 
+    def connect(self, node1: Node, node2: Node) -> None:
+        idx_1, idx_2 = self.node_list.index(node1), self.node_list.index(node2)
+        if self.connections[idx_1, idx_2] == 0:
+            self.connections[idx_1, idx_2] = 1
+        elif self.connections[idx_1, idx_2] == 1:
+            logger.warning(f"{node1} and {node2} are already connected")
+        logger.info(f"{node1} -> {node2}")
 
-    def connect(self, node1: Node, node2: Node):
-        self.connections[self.node_list.index(node1), self.node_list.index(node2)] = 1
-        logger.info(f"{node1.name} -> {node2.name}")
-
-    def disconnect(self, node1: Node, node2: Node):
-        self.connections[self.node_list.index(node1), self.node_list.index(node2)] = 0
-        logger.info(f"{node1.name} -/-> {node2.name}")
+    def disconnect(self, node1: Node, node2: Node) -> None:
+        idx_1, idx_2 = self.node_list.index(node1), self.node_list.index(node2)
+        if self.connections[idx_1, idx_2] == 1:
+            self.connections[idx_1, idx_2] = 0
+        elif self.connections[idx_2, idx_1] == 0:
+            logger.warning(f"{node1} and {node2} are not connected")
+        logger.info(f"{node1} -/-> {node2}")
 
     def run(self):
         for node in self.nodes:
             node.on_connect()
             node.on_disconnect()
 
-
-    def _add(self, num_nodes: int) -> np.ndarray:
+    def _update_connection(self, num_nodes: int) -> np.ndarray:
         old_conn = self.connections.copy()
         if len(self.connections.shape) == 1:
             n = 0
@@ -154,9 +186,27 @@ class Graph:
             self.connections[i, i] = 1
 
     @property
-    def node_list(self):
+    def node_list(self) -> list[Node]:
         return list(self.nodes)
 
-    def show_nodes(self):
-        for i, node in enumerate(self.node_list):
+    def print_nodes(self) -> None:
+        print("=" * 40 + " Nodes " + "=" * 40)
+        for i, node in enumerate(self.nodes):
             print(f"{i}: {node}")
+        print("=" * 87)
+
+    def visualize(
+        self,
+        filename: str = "graph",
+        directory: str | None = None,
+        view: bool = False,
+        **kwargs,
+    ) -> None:
+        g = graphviz.Digraph()
+        for node in self.node_list:
+            g.node(node.name)
+        for i in range(self.connections.shape[0]):
+            for j in range(self.connections.shape[1]):
+                if self.connections[i, j] == 1 and i != j:
+                    g.edge(self.node_list[i].name, self.node_list[j].name)
+        g.render(filename, directory, format="png", cleanup=True, view=view, **kwargs)
